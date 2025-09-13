@@ -1,10 +1,11 @@
 // /api/getTweets
 // Requires: TWITTER_BEARER_TOKEN
 // Optional: CORS_ORIGIN, USER_ID (overrides hardcoded id)
+// Optional: REFRESH_SECONDS (defaults to 900 = 15 minutes)
 
 let inMemoryCache = {
-    json: null,        // last successful JSON payload
-    ts: 0              // timestamp (ms)
+    json: null,        // last successful JSON payload (first page only)
+    ts: 0              // timestamp (ms) of last successful refresh
   };
   let backoffUntil = 0; // epoch ms until which we won't hit X again after a 429
   
@@ -22,17 +23,24 @@ let inMemoryCache = {
     const BEARER_TOKEN = process.env.TWITTER_BEARER_TOKEN;
     if (!BEARER_TOKEN) return res.status(500).json({ error: 'Bearer token missing from environment.' });
   
-    // Use your discovered rest_id; env var wins if provided
     const USER_ID = process.env.USER_ID || '1802749491268771841';
-  
     const { next_token } = req.query || {};
   
-    // Heavier CDN/browser cache to slash hits (tweak to taste)
-    // s-maxage: edge cache (10 min), stale-while-revalidate: 30 min, browser: 2 min
+    // How long we consider the cache "fresh" (defaults to 15 minutes)
+    const REFRESH_MS = (parseInt(process.env.REFRESH_SECONDS || '900', 10) || 900) * 1000;
+  
+    // Cache headers for clients (the server still enforces the 15-min gate internally)
     res.setHeader('Cache-Control', 's-maxage=600, stale-while-revalidate=1800, max-age=120');
   
-    // If we're in backoff and have any cache, serve it immediately
     const now = Date.now();
+  
+    // ---- 15-minute self-throttle for FIRST PAGE ONLY (no next_token) ----
+    if (!next_token && inMemoryCache.json && (now - inMemoryCache.ts) < REFRESH_MS) {
+      res.setHeader('X-Cache', 'MEMORY_FRESH');
+      return res.status(200).json(inMemoryCache.json);
+    }
+  
+    // If we're in backoff and have any cache, serve it immediately
     if (now < backoffUntil && inMemoryCache.json) {
       res.setHeader('X-Cache', 'STALE_BACKOFF');
       return res.status(200).json(inMemoryCache.json);
@@ -60,8 +68,7 @@ let inMemoryCache = {
         // If 429, set backoff and serve stale if we have any
         if (r.status === 429) {
           const retryAfter = parseInt(r.headers.get('retry-after') || '0', 10);
-          // Default to 5 minutes if no header
-          const backoffMs = (isFinite(retryAfter) && retryAfter > 0 ? retryAfter : 300) * 1000;
+          const backoffMs = (isFinite(retryAfter) && retryAfter > 0 ? retryAfter : 300) * 1000; // default 5m
           backoffUntil = Date.now() + backoffMs;
   
           if (inMemoryCache.json) {
@@ -69,7 +76,6 @@ let inMemoryCache = {
             return res.status(200).json(inMemoryCache.json);
           }
   
-          // No cache available: send a 503 so your UI can show a friendly message
           return res.status(503).json({
             error: 'Rate limited by X (no cached data)',
             detail: body
@@ -77,7 +83,7 @@ let inMemoryCache = {
         }
   
         // Other errors: if we have cache, serve stale; else bubble the error
-        if (inMemoryCache.json) {
+        if (!next_token && inMemoryCache.json) {
           res.setHeader('X-Cache', 'STALE_ERROR');
           return res.status(200).json(inMemoryCache.json);
         }
@@ -89,22 +95,25 @@ let inMemoryCache = {
       const json = await r.json();
       if (!json?.data) {
         // If empty but we have cached data, serve stale instead of empty
-        if (inMemoryCache.json) {
+        if (!next_token && inMemoryCache.json) {
           res.setHeader('X-Cache', 'STALE_EMPTY');
           return res.status(200).json(inMemoryCache.json);
         }
         return res.status(404).json({ error: 'No tweets found or invalid response', details: json });
       }
   
-      // Cache only the first page (most common)
+      // Only cache the first page and mark its timestamp, enforcing the 15-min window
       if (!next_token) {
         inMemoryCache = { json, ts: Date.now() };
+        res.setHeader('X-Cache', 'MEMORY_REFRESHED');
+      } else {
+        res.setHeader('X-Cache', 'PAGED_NO_CACHE');
       }
   
       return res.status(200).json(json);
     } catch (e) {
-      // On unexpected errors, prefer stale if present
-      if (inMemoryCache.json) {
+      // On unexpected errors, prefer stale if present (first page only)
+      if (!next_token && inMemoryCache.json) {
         res.setHeader('X-Cache', 'STALE_EXCEPTION');
         return res.status(200).json(inMemoryCache.json);
       }
