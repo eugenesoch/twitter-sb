@@ -40,7 +40,7 @@ let inMemoryCache = {
     try {
       // 1) Fetch tweets WITH media + author (for images + avatar)
       const params = new URLSearchParams({
-        max_results: '5',
+        max_results: '25',
         expansions: 'attachments.media_keys,author_id',
         'tweet.fields': 'created_at,text,attachments,author_id',
         'user.fields': 'name,username,profile_image_url',
