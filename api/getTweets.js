@@ -1,14 +1,12 @@
-// Vercel Serverless Function: /api/getTweets?next_token=...
-// ENV VARS (set in Vercel):
-// - TWITTER_BEARER_TOKEN (required)
-// - CORS_ORIGIN (optional, e.g. https://your-site.webflow.io)
-// - USER_ID (optional: overrides the hardcoded fallback)
+// /api/getTweets
+// Requires: TWITTER_BEARER_TOKEN
+// Optional: CORS_ORIGIN, USER_ID (overrides hardcoded id)
 
 let inMemoryCache = {
-    key: null,   // cache key (page token)
-    json: null,  // last successful JSON payload
-    ts: 0        // timestamp (ms)
+    json: null,        // last successful JSON payload
+    ts: 0              // timestamp (ms)
   };
+  let backoffUntil = 0; // epoch ms until which we won't hit X again after a 429
   
   export default async function handler(req, res) {
     // ---- CORS ----
@@ -24,21 +22,24 @@ let inMemoryCache = {
     const BEARER_TOKEN = process.env.TWITTER_BEARER_TOKEN;
     if (!BEARER_TOKEN) return res.status(500).json({ error: 'Bearer token missing from environment.' });
   
-    // Use your found rest_id; env var wins if provided
+    // Use your discovered rest_id; env var wins if provided
     const USER_ID = process.env.USER_ID || '1802749491268771841';
   
-    // Accept pagination token; username no longer needed
     const { next_token } = req.query || {};
   
-    // CDN/browser cache (reduce hits from many visitors)
-    res.setHeader('Cache-Control', 's-maxage=180, stale-while-revalidate=300, max-age=60');
+    // Heavier CDN/browser cache to slash hits (tweak to taste)
+    // s-maxage: edge cache (10 min), stale-while-revalidate: 30 min, browser: 2 min
+    res.setHeader('Cache-Control', 's-maxage=600, stale-while-revalidate=1800, max-age=120');
   
-    // Small server-side memory cache to serve if Twitter 429s
-    const cacheTTLms = 5 * 60 * 1000; // 5 minutes
-    const cacheKey = `${next_token || ''}`;
+    // If we're in backoff and have any cache, serve it immediately
+    const now = Date.now();
+    if (now < backoffUntil && inMemoryCache.json) {
+      res.setHeader('X-Cache', 'STALE_BACKOFF');
+      return res.status(200).json(inMemoryCache.json);
+    }
   
     try {
-      // 1) Fetch tweets WITH media + author (for images + avatar)
+      // Build fields so images/avatars render
       const params = new URLSearchParams({
         max_results: '5',
         expansions: 'attachments.media_keys,author_id',
@@ -48,38 +49,67 @@ let inMemoryCache = {
       });
       if (next_token) params.set('pagination_token', String(next_token));
   
-      const tweetsRes = await fetch(
-        `https://api.twitter.com/2/users/${USER_ID}/tweets?${params.toString()}`,
-        { headers: { Authorization: `Bearer ${BEARER_TOKEN}` }, cache: 'no-store' }
-      );
+      const r = await fetch(`https://api.twitter.com/2/users/${USER_ID}/tweets?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${BEARER_TOKEN}` },
+        cache: 'no-store'
+      });
   
-      if (!tweetsRes.ok) {
-        const detail = await tweetsRes.text();
-        // Serve stale cache on 429 (rate limit) to keep your site working
-        if (tweetsRes.status === 429 && inMemoryCache.json && (Date.now() - inMemoryCache.ts) < 24 * 60 * 60 * 1000) {
+      if (!r.ok) {
+        const body = await r.text();
+  
+        // If 429, set backoff and serve stale if we have any
+        if (r.status === 429) {
+          const retryAfter = parseInt(r.headers.get('retry-after') || '0', 10);
+          // Default to 5 minutes if no header
+          const backoffMs = (isFinite(retryAfter) && retryAfter > 0 ? retryAfter : 300) * 1000;
+          backoffUntil = Date.now() + backoffMs;
+  
+          if (inMemoryCache.json) {
+            res.setHeader('X-Cache', 'STALE_429');
+            return res.status(200).json(inMemoryCache.json);
+          }
+  
+          // No cache available: send a 503 so your UI can show a friendly message
+          return res.status(503).json({
+            error: 'Rate limited by X (no cached data)',
+            detail: body
+          });
+        }
+  
+        // Other errors: if we have cache, serve stale; else bubble the error
+        if (inMemoryCache.json) {
+          res.setHeader('X-Cache', 'STALE_ERROR');
           return res.status(200).json(inMemoryCache.json);
         }
-        return res.status(tweetsRes.status).json({ error: 'Tweets fetch failed', detail });
+        return res.status(r.status).json({ error: 'Tweets fetch failed', detail: body });
       }
   
-      const json = await tweetsRes.json();
+      // Success: clear backoff and cache the result
+      backoffUntil = 0;
+      const json = await r.json();
       if (!json?.data) {
+        // If empty but we have cached data, serve stale instead of empty
+        if (inMemoryCache.json) {
+          res.setHeader('X-Cache', 'STALE_EMPTY');
+          return res.status(200).json(inMemoryCache.json);
+        }
         return res.status(404).json({ error: 'No tweets found or invalid response', details: json });
       }
   
-      // 2) Update small in-memory cache (best-effort; not guaranteed across cold starts)
-      if (!next_token) { // only cache first page
-        inMemoryCache = { key: cacheKey, json, ts: Date.now() };
+      // Cache only the first page (most common)
+      if (!next_token) {
+        inMemoryCache = { json, ts: Date.now() };
       }
   
       return res.status(200).json(json);
-    } catch (err) {
-      // serve stale on unexpected errors if available
-      if (inMemoryCache.json && (Date.now() - inMemoryCache.ts) < cacheTTLms) {
+    } catch (e) {
+      // On unexpected errors, prefer stale if present
+      if (inMemoryCache.json) {
+        res.setHeader('X-Cache', 'STALE_EXCEPTION');
         return res.status(200).json(inMemoryCache.json);
       }
-      console.error('Error in /api/getTweets:', err);
-      return res.status(500).json({ error: 'Server error', message: String(err) });
+      console.error('Error in /api/getTweets:', e);
+      return res.status(500).json({ error: 'Server error', message: String(e) });
     }
   }
   
