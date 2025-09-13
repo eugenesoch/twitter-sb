@@ -1,47 +1,97 @@
-export default async function handler(req, res) {
-    const BEARER_TOKEN = process.env.TWITTER_BEARER_TOKEN;
-    const username = 'SonicBoomFest';
+// Vercel Serverless Function: /api/getTweets?username=SonicBoomFest&next_token=...
+// ENV VARS (set in Vercel):
+// - TWITTER_BEARER_TOKEN (required)
+// - CORS_ORIGIN (optional, e.g. https://your-site.webflow.io)
+// - USER_ID (optional, e.g. "123456789")  <-- use this to skip username lookup
+
+let inMemoryCache = {
+    key: null,            // cache key (username + token)
+    json: null,           // last successful JSON payload
+    ts: 0                 // timestamp (ms)
+  };
   
-    if (!BEARER_TOKEN) {
-      return res.status(500).json({ error: 'Bearer token missing from environment.' });
-    }
+  export default async function handler(req, res) {
+    // ---- CORS ----
+    const allowOrigin = process.env.CORS_ORIGIN || '*';
+    res.setHeader('Access-Control-Allow-Origin', allowOrigin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  
+    if (req.method === 'OPTIONS') return res.status(204).end();
+    if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
+  
+    const BEARER_TOKEN = process.env.TWITTER_BEARER_TOKEN;
+    if (!BEARER_TOKEN) return res.status(500).json({ error: 'Bearer token missing from environment.' });
+  
+    const { username = 'SonicBoomFest', next_token } = req.query || {};
+    const USER_ID = process.env.USER_ID; // if set, we skip lookup entirely
+  
+    // CDN/browser cache (reduce hits from many visitors)
+    res.setHeader('Cache-Control', 's-maxage=180, stale-while-revalidate=300, max-age=60');
+  
+    // Small server-side memory cache to serve if Twitter 429s
+    const cacheTTLms = 5 * 60 * 1000; // 5 minutes
+    const cacheKey = `${username}::${next_token || ''}`;
   
     try {
-      // Step 1: Get user ID by username
-      const userRes = await fetch(`https://api.twitter.com/2/users/by/username/${username}`, {
-        headers: {
-          'Authorization': `Bearer ${BEARER_TOKEN}`
+      // 1) get userId (prefer env to avoid rate-limited lookup)
+      let userId = USER_ID;
+      if (!userId) {
+        const userRes = await fetch(
+          `https://api.twitter.com/2/users/by/username/${encodeURIComponent(username)}`,
+          { headers: { Authorization: `Bearer ${BEARER_TOKEN}` }, cache: 'no-store' }
+        );
+        if (!userRes.ok) {
+          const detail = await userRes.text();
+          // If rate-limited and we have cached data, serve stale
+          if (userRes.status === 429 && inMemoryCache.json && (Date.now() - inMemoryCache.ts) < 24 * 60 * 60 * 1000) {
+            return res.status(200).json(inMemoryCache.json);
+          }
+          return res.status(userRes.status).json({ error: 'User lookup failed', detail });
         }
-      });
-  
-      const userData = await userRes.json();
-  
-      if (!userData.data || !userData.data.id) {
-        return res.status(404).json({ error: 'Twitter user not found.', details: userData });
+        const userJson = await userRes.json();
+        userId = userJson?.data?.id;
+        if (!userId) return res.status(404).json({ error: 'Twitter user not found', details: userJson });
       }
   
-      const userId = userData.data.id;
-  
-      // Step 2: Get tweets by user ID
-      const tweetsRes = await fetch(`https://api.twitter.com/2/users/${userId}/tweets?max_results=5&tweet.fields=created_at,text`, {
-        headers: {
-          'Authorization': `Bearer ${BEARER_TOKEN}`
-        }
+      // 2) fetch tweets
+      const params = new URLSearchParams({
+        max_results: '5',
+        'tweet.fields': 'created_at,text'
       });
+      if (next_token) params.set('pagination_token', String(next_token));
   
-      const tweetsData = await tweetsRes.json();
+      const tweetsRes = await fetch(
+        `https://api.twitter.com/2/users/${userId}/tweets?${params.toString()}`,
+        { headers: { Authorization: `Bearer ${BEARER_TOKEN}` }, cache: 'no-store' }
+      );
   
-      if (!tweetsData.data) {
-        return res.status(404).json({ error: 'No tweets found or invalid response.', details: tweetsData });
+      if (!tweetsRes.ok) {
+        const detail = await tweetsRes.text();
+        // Serve stale cache on 429 (rate limit) to keep your site working
+        if (tweetsRes.status === 429 && inMemoryCache.json && (Date.now() - inMemoryCache.ts) < 24 * 60 * 60 * 1000) {
+          return res.status(200).json(inMemoryCache.json);
+        }
+        return res.status(tweetsRes.status).json({ error: 'Tweets fetch failed', detail });
       }
   
-      // Step 3: Return tweets
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      return res.status(200).json(tweetsData);
+      const json = await tweetsRes.json();
+      if (!json?.data) return res.status(404).json({ error: 'No tweets found or invalid response', details: json });
   
+      // Update small in-memory cache (best-effort; not guaranteed across cold starts)
+      if (!next_token) { // only cache first page
+        inMemoryCache = { key: cacheKey, json, ts: Date.now() };
+      }
+  
+      return res.status(200).json(json);
     } catch (err) {
-      console.error('Error in Twitter API function:', err);
-      return res.status(500).json({ error: 'Server error', message: err.message });
+      // serve stale on unexpected errors if available
+      if (inMemoryCache.json && (Date.now() - inMemoryCache.ts) < cacheTTLms) {
+        return res.status(200).json(inMemoryCache.json);
+      }
+      console.error('Error in /api/getTweets:', err);
+      return res.status(500).json({ error: 'Server error', message: String(err) });
     }
   }
   
